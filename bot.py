@@ -13,6 +13,9 @@ Telegram 机器人 — 群聊/频道关键词监听 + 随机视频转发
 
 import os
 import sqlite3
+import time
+import asyncio
+import sys
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -289,7 +292,15 @@ def main():
     print(f"  视频收录频道:  {CHANNEL_ID or '(未配置)'}")
     print("=" * 50)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # 构建 Application，配置超时时间
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
 
     # --- 命令 ---
     app.add_handler(CommandHandler("start", start))
@@ -302,7 +313,7 @@ def main():
         on_source_message,
     ))
     app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS,  # 同时匹配 group 和 supergroup
+        filters.ChatType.GROUPS,
         on_source_message,
     ))
     print("✅ 群聊/频道监听已启用（自动发现 + 关键词转发）")
@@ -322,11 +333,35 @@ def main():
         ))
         print("✅ 视频收录已启用")
 
+    # --- 带重试的运行循环 ---
     print("🤖 机器人启动中...")
-    app.run_polling(
-        allowed_updates=["channel_post", "message"],
-        drop_pending_updates=True,
-    )
+    retry_delay = 5  # 初始重试间隔（秒）
+
+    while True:
+        try:
+            app.run_polling(
+                allowed_updates=["channel_post", "message"],
+                drop_pending_updates=True,
+                poll_interval=1.0,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            print("🛑 收到退出信号，正在关闭...")
+            sys.exit(0)
+        except Exception as e:
+            print(f"❌ 连接断开: {e}")
+            print(f"   {retry_delay} 秒后重试...")
+            time.sleep(retry_delay)
+            # 指数退避，最多 60 秒
+            retry_delay = min(retry_delay * 2, 60)
+            # 重置 application 的连接
+            try:
+                asyncio.run(app.shutdown())
+            except Exception:
+                pass
+            try:
+                asyncio.run(app.initialize())
+            except Exception as ie:
+                print(f"   ⚠️ 重连失败: {ie}")
 
 
 if __name__ == "__main__":
