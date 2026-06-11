@@ -1,0 +1,4 @@
+.env
+videos.db
+__pycache__/
+*.pyc
