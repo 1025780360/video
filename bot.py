@@ -14,7 +14,6 @@ Telegram 机器人 — 群聊/频道关键词监听 + 随机视频转发
 import os
 import sqlite3
 import time
-import asyncio
 import sys
 from datetime import datetime
 
@@ -276,12 +275,53 @@ async def on_channel_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[{datetime.now()}] ✅ 收录视频 message_id={msg.message_id}")
 
 
+# ==================== 错误处理 ====================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB 运行时错误回调，防止单个错误导致整个机器人崩溃"""
+    err = context.error
+    print(f"[{datetime.now()}] ⚠️ 运行时错误: {err}")
+
+
+def build_app() -> Application:
+    """构建 Application（每次重试时重新创建，避免状态残留）"""
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
+
+    # 错误处理器
+    app.add_error_handler(error_handler)
+
+    # 命令
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("random", random_video))
+    app.add_handler(CommandHandler("stats", stats))
+
+    # 群聊 + 频道消息
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_source_message))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_source_message))
+
+    # 目标机器人回复
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, on_target_bot_reply))
+
+    # 视频收录
+    if CHANNEL_ID:
+        app.add_handler(MessageHandler(
+            filters.ChatType.CHANNEL & filters.VIDEO, on_channel_video,
+        ))
+
+    return app
+
+
 # ==================== 主程序 ====================
 def main():
     init_db()
     print(f"📦 数据库就绪，当前收录 {get_video_count()} 条视频")
 
-    # 打印当前配置
     print("=" * 50)
     print("当前配置：")
     print(f"  BOT_TOKEN:     {BOT_TOKEN[:8]}...（已隐藏）")
@@ -292,52 +332,16 @@ def main():
     print(f"  视频收录频道:  {CHANNEL_ID or '(未配置)'}")
     print("=" * 50)
 
-    # 构建 Application，配置超时时间
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .build()
-    )
-
-    # --- 命令 ---
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("random", random_video))
-    app.add_handler(CommandHandler("stats", stats))
-
-    # --- 群聊 + 频道消息（始终启用：自动发现 + 关键词转发）---
-    app.add_handler(MessageHandler(
-        filters.ChatType.CHANNEL,
-        on_source_message,
-    ))
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS,
-        on_source_message,
-    ))
     print("✅ 群聊/频道监听已启用（自动发现 + 关键词转发）")
-
-    # --- 目标机器人回复 ---
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE,
-        on_target_bot_reply,
-    ))
     print("✅ 目标机器人回复监听已启用")
-
-    # --- 视频收录 ---
     if CHANNEL_ID:
-        app.add_handler(MessageHandler(
-            filters.ChatType.CHANNEL & filters.VIDEO,
-            on_channel_video,
-        ))
         print("✅ 视频收录已启用")
 
-    # --- 带重试的运行循环 ---
     print("🤖 机器人启动中...")
-    retry_delay = 5  # 初始重试间隔（秒）
+    retry_delay = 5
 
     while True:
+        app = build_app()
         try:
             app.run_polling(
                 allowed_updates=["channel_post", "message"],
@@ -348,20 +352,17 @@ def main():
             print("🛑 收到退出信号，正在关闭...")
             sys.exit(0)
         except Exception as e:
-            print(f"❌ 连接断开: {e}")
-            print(f"   {retry_delay} 秒后重试...")
-            time.sleep(retry_delay)
-            # 指数退避，最多 60 秒
-            retry_delay = min(retry_delay * 2, 60)
-            # 重置 application 的连接
-            try:
-                asyncio.run(app.shutdown())
-            except Exception:
-                pass
-            try:
-                asyncio.run(app.initialize())
-            except Exception as ie:
-                print(f"   ⚠️ 重连失败: {ie}")
+            err_str = str(e)
+            # Conflict 意味着旧实例还未完全退出，延长等待
+            if "Conflict" in err_str:
+                wait = 15
+                print(f"⏳ 检测到旧实例未退出，等待 {wait} 秒...")
+                time.sleep(wait)
+            else:
+                print(f"❌ 连接出错: {e}")
+                print(f"   {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
 
 
 if __name__ == "__main__":
