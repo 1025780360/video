@@ -1,11 +1,14 @@
 """
-Telegram 机器人 — 多渠道关键词监听 + 随机视频转发
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-功能 1：关键词转发链
-  源频道发布消息 → 识别关键词 → 转发给指定机器人 → 机器人回复 → 转发回复到你的频道
+Telegram 机器人 — 群聊/频道关键词监听 + 随机视频转发
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+功能 1：关键词转发链（支持群聊 + 频道）
+  源群聊/频道消息 → 识别关键词 → 转发给指定机器人 → 机器人回复 → 转发到你的频道
 
-功能 2：随机视频
-  自动记录频道中的视频，/random 随机转发，/stats 查看统计
+功能 2：未知群聊自动发现
+  机器人加入新群后，只要有人说话，日志就会打印群 ID 和名称
+
+功能 3：随机视频
+  /random 随机转发一条历史视频，/stats 查看统计
 """
 
 import os
@@ -30,32 +33,35 @@ if not BOT_TOKEN:
     raise RuntimeError("未设置 BOT_TOKEN")
 
 # --- 关键词转发链 ---
-# 监听的源频道，逗号分隔。例如: @chan1,@chan2,-100xxx
+# 监听的来源（群聊或频道），逗号分隔。支持 @用户名 和 -100xxx 数字 ID
 SOURCE_CHANNELS = [
     c.strip()
     for c in os.getenv("SOURCE_CHANNELS", "").split(",")
     if c.strip()
 ]
-# 触发关键词，逗号分隔。命中任意一个即触发
+# 触发关键词，逗号分隔，不区分大小写，命中任意一个即触发
 KEYWORDS = [
     k.strip()
     for k in os.getenv("KEYWORDS", "").split(",")
     if k.strip()
 ]
-# 目标机器人（接收转发消息的机器人）
+# 目标机器人 @用户名
 TARGET_BOT = os.getenv("TARGET_BOT", "").strip()
-# 回复转发目的地（你的频道）
+# 目标机器人回复后转发到哪个频道
 DEST_CHANNEL = os.getenv("DEST_CHANNEL", "").strip()
 
-# --- 随机视频（保留旧功能）---
+# --- 随机视频 ---
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 
 DB_PATH = "videos.db"
 
+# 用于防止重复打印发现日志
+_discovered_chats: set[int] = set()
+
 
 # ==================== 工具函数 ====================
-def is_channel_match(chat, config_id: str) -> bool:
-    """判断一个 chat 是否匹配配置中的频道 ID（支持 @username 和数字 ID）"""
+def is_chat_match(chat, config_id: str) -> bool:
+    """判断一个 chat 是否匹配配置中的 ID（支持 @username 和数字 ID）"""
     chat_id_str = str(chat.id)
     expected = config_id.lstrip("@")
 
@@ -74,7 +80,19 @@ def any_keyword_match(text: str) -> bool:
     return any(kw.lower() in text_lower for kw in KEYWORDS)
 
 
-# ==================== 数据库（随机视频功能）====================
+def get_chat_label(chat) -> str:
+    """返回便于阅读的 chat 标识"""
+    parts = [str(chat.id)]
+    title = getattr(chat, "title", "") or ""
+    username = getattr(chat, "username", "") or ""
+    if title:
+        parts.append(f"'{title}'")
+    if username:
+        parts.append(f"@{username}")
+    return ", ".join(parts)
+
+
+# ==================== 数据库（随机视频）====================
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -126,7 +144,7 @@ def get_video_count() -> int:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 你好！我是多功能转发机器人。\n\n"
-        "📡 关键词转发链：监听多个频道 → 识别关键词 → 转给指定机器人 → 把回复转回你的频道\n\n"
+        "📡 关键词转发链：监听群聊/频道 → 识别关键词 → 转给指定机器人 → 把回复转回你的频道\n\n"
         "🎲 命令列表：\n"
         "/random - 随机转发一条历史视频\n"
         "/stats  - 查看已收录的视频数量"
@@ -154,69 +172,88 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📊 已收录 {count} 条视频")
 
 
-# ==================== 核心：关键词转发链 ====================
-async def on_source_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """源频道有新消息 → 检查关键词 → 转发给目标机器人"""
-    msg = update.channel_post
+# ==================== 核心：消息处理（群聊 + 频道）====================
+async def on_source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    统一处理群聊消息和频道消息：
+      1. 自动发现未知群聊/频道，打印 ID 到日志
+      2. 检查关键词 → 转发给目标机器人
+    """
+    # 频道消息在 channel_post 字段，群聊消息在 message 字段
+    msg = update.channel_post or update.message
     if msg is None:
         return
 
-    # 检查这条消息是否来自我们监听的源频道
-    is_source = any(is_channel_match(msg.chat, ch) for ch in SOURCE_CHANNELS)
+    chat = msg.chat
+    chat_id = chat.id
+
+    # ---------- 自动发现未知来源 ----------
+    source_list = SOURCE_CHANNELS  # may be empty list
+    is_source = any(is_chat_match(chat, ch) for ch in source_list)
+
+    if not is_source and chat_id not in _discovered_chats:
+        _discovered_chats.add(chat_id)
+        chat_type = chat.type or "?"
+        label = get_chat_label(chat)
+        print("=" * 50)
+        print(f"[🔍 发现新{ '群聊' if chat_type in ('group','supergroup') else '频道' }]")
+        print(f"    ID: {chat_id}")
+        print(f"    类型: {chat_type}")
+        print(f"    名称: {label}")
+        print(f"    把上面这个 ID 加到 Zeabur 环境变量 SOURCE_CHANNELS 即可开始监听")
+        print("=" * 50)
+
+    # ---------- 关键词转发 ----------
+    if not SOURCE_CHANNELS or not KEYWORDS or not TARGET_BOT or not DEST_CHANNEL:
+        return  # 配置不完整，只做发现不转发
+
     if not is_source:
         return
 
-    # 提取消息文本（支持 caption）
     text = msg.text or msg.caption or ""
-
-    # 检查关键词
     if not any_keyword_match(text):
         return
 
-    # 命中关键词！转发给目标机器人
+    # 命中！转发给目标机器人
+    matched = [kw for kw in KEYWORDS if kw.lower() in text.lower()]
     try:
         await context.bot.forward_message(
             chat_id=TARGET_BOT,
-            from_chat_id=msg.chat_id,
+            from_chat_id=chat_id,
             message_id=msg.message_id,
         )
         print(
-            f"[{datetime.now()}] 🎯 命中关键词 → 已转发给 {TARGET_BOT} "
-            f"（来源: {msg.chat_id}, 关键词匹配: "
-            f"{[kw for kw in KEYWORDS if kw.lower() in text.lower()]}）"
+            f"[{datetime.now()}] 🎯 命中 {matched} "
+            f"→ 已转发至 {TARGET_BOT}（来源: {get_chat_label(chat)}）"
         )
     except Exception as e:
-        print(f"[{datetime.now()}] ❌ 转发给 {TARGET_BOT} 失败：{e}")
+        print(f"[{datetime.now()}] ❌ 转发至 {TARGET_BOT} 失败: {e}")
 
 
+# ==================== 目标机器人回复 → 转发到你的频道 ====================
 async def on_target_bot_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """目标机器人回复了 → 转发回复到目标频道"""
+    """目标机器人回复 → 转发到目标频道"""
     msg = update.message
     if msg is None:
         return
 
-    # 只处理来自目标机器人的私聊消息
     target_username = TARGET_BOT.lstrip("@")
     if not msg.from_user or msg.from_user.username != target_username:
         return
 
-    # 转发机器人的回复到目标频道
     try:
         await context.bot.forward_message(
             chat_id=DEST_CHANNEL,
             from_chat_id=msg.chat_id,
             message_id=msg.message_id,
         )
-        print(
-            f"[{datetime.now()}] 📤 已转发 {TARGET_BOT} 的回复到 {DEST_CHANNEL}"
-        )
+        print(f"[{datetime.now()}] 📤 已转发 {TARGET_BOT} 的回复 → {DEST_CHANNEL}")
     except Exception as e:
-        print(f"[{datetime.now()}] ❌ 转发到 {DEST_CHANNEL} 失败：{e}")
+        print(f"[{datetime.now()}] ❌ 转发至 {DEST_CHANNEL} 失败: {e}")
 
 
-# ==================== 随机视频收录 ====================
+# ==================== 视频收录（/random 用）====================
 async def on_channel_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """频道发布视频 → 记录到数据库（供 /random 使用）"""
     msg = update.channel_post
     if msg is None or msg.video is None:
         return
@@ -224,7 +261,7 @@ async def on_channel_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not CHANNEL_ID:
         return
 
-    if not is_channel_match(msg.chat, CHANNEL_ID):
+    if not is_chat_match(msg.chat, CHANNEL_ID):
         return
 
     add_video(
@@ -242,15 +279,15 @@ def main():
     print(f"📦 数据库就绪，当前收录 {get_video_count()} 条视频")
 
     # 打印当前配置
-    if SOURCE_CHANNELS:
-        print(f"📡 监听频道: {SOURCE_CHANNELS}")
-        print(f"🔑 关键词: {KEYWORDS}")
-        print(f"🤖 目标机器人: {TARGET_BOT}")
-        print(f"📢 转发目的地: {DEST_CHANNEL}")
-    else:
-        print("⚠️  未配置 SOURCE_CHANNELS，关键词转发功能未启用")
-    if CHANNEL_ID:
-        print(f"🎥 视频收录频道: {CHANNEL_ID}")
+    print("=" * 50)
+    print("当前配置：")
+    print(f"  BOT_TOKEN:     {BOT_TOKEN[:8]}...（已隐藏）")
+    print(f"  源频道/群聊:   {SOURCE_CHANNELS or '(未配置，仅自动发现)'}")
+    print(f"  关键词:        {KEYWORDS or '(未配置)'}")
+    print(f"  目标机器人:    {TARGET_BOT or '(未配置)'}")
+    print(f"  转发目的地:    {DEST_CHANNEL or '(未配置)'}")
+    print(f"  视频收录频道:  {CHANNEL_ID or '(未配置)'}")
+    print("=" * 50)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -259,34 +296,30 @@ def main():
     app.add_handler(CommandHandler("random", random_video))
     app.add_handler(CommandHandler("stats", stats))
 
-    # --- 关键词转发链 ---
-    if SOURCE_CHANNELS and KEYWORDS and TARGET_BOT and DEST_CHANNEL:
-        # 监听源频道的所有消息（不只是视频）
-        app.add_handler(
-            MessageHandler(
-                filters.ChatType.CHANNEL,
-                on_source_channel_post,
-            )
-        )
-        # 监听目标机器人在私聊中的回复
-        app.add_handler(
-            MessageHandler(
-                filters.ChatType.PRIVATE,
-                on_target_bot_reply,
-            )
-        )
-        print("✅ 关键词转发链已启用")
-    else:
-        print("⚠️  关键词转发链未完整配置，已禁用")
+    # --- 群聊 + 频道消息（始终启用：自动发现 + 关键词转发）---
+    app.add_handler(MessageHandler(
+        filters.ChatType.CHANNEL,
+        on_source_message,
+    ))
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS,  # 同时匹配 group 和 supergroup
+        on_source_message,
+    ))
+    print("✅ 群聊/频道监听已启用（自动发现 + 关键词转发）")
+
+    # --- 目标机器人回复 ---
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE,
+        on_target_bot_reply,
+    ))
+    print("✅ 目标机器人回复监听已启用")
 
     # --- 视频收录 ---
     if CHANNEL_ID:
-        app.add_handler(
-            MessageHandler(
-                filters.ChatType.CHANNEL & filters.VIDEO,
-                on_channel_video,
-            )
-        )
+        app.add_handler(MessageHandler(
+            filters.ChatType.CHANNEL & filters.VIDEO,
+            on_channel_video,
+        ))
         print("✅ 视频收录已启用")
 
     print("🤖 机器人启动中...")
