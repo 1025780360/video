@@ -9,14 +9,16 @@ Telegram 机器人 — 群聊/频道关键词监听 + 随机视频转发
 
 功能 3：随机视频
   /random 随机转发一条历史视频，/stats 查看统计
+  使用 PostgreSQL 持久化存储（Zeabur 云数据库）
 """
 
 import os
-import sqlite3
 import time
 import sys
 from datetime import datetime
 
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -34,39 +36,37 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("未设置 BOT_TOKEN")
 
+# PostgreSQL 连接地址（Zeabur 云数据库提供）
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
 # --- 关键词转发链 ---
-# 监听的来源（群聊或频道），逗号分隔。支持 @用户名 和 -100xxx 数字 ID
 SOURCE_CHANNELS = [
     c.strip()
     for c in os.getenv("SOURCE_CHANNELS", "").split(",")
     if c.strip()
 ]
-# 触发关键词，逗号分隔，不区分大小写，命中任意一个即触发
 KEYWORDS = [
     k.strip()
     for k in os.getenv("KEYWORDS", "").split(",")
     if k.strip()
 ]
-# 目标机器人 @用户名
 TARGET_BOT = os.getenv("TARGET_BOT", "").strip()
-# 目标机器人回复后转发到哪个频道
 DEST_CHANNEL = os.getenv("DEST_CHANNEL", "").strip()
 
 # --- 随机视频 ---
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 
-DB_PATH = "videos.db"
-
-# 用于防止重复打印发现日志
+# 防止重复打印发现日志
 _discovered_chats: set[int] = set()
+
+# PostgreSQL 连接
+_pg_conn = None
 
 
 # ==================== 工具函数 ====================
 def is_chat_match(chat, config_id: str) -> bool:
-    """判断一个 chat 是否匹配配置中的 ID（支持 @username 和数字 ID）"""
     chat_id_str = str(chat.id)
     expected = config_id.lstrip("@")
-
     if chat_id_str == expected:
         return True
     if chat.username and f"@{chat.username}" == config_id:
@@ -75,7 +75,6 @@ def is_chat_match(chat, config_id: str) -> bool:
 
 
 def any_keyword_match(text: str) -> bool:
-    """文本中是否包含任意一个关键词（不区分大小写）"""
     if not text:
         return False
     text_lower = text.lower()
@@ -83,7 +82,6 @@ def any_keyword_match(text: str) -> bool:
 
 
 def get_chat_label(chat) -> str:
-    """返回便于阅读的 chat 标识"""
     parts = [str(chat.id)]
     title = getattr(chat, "title", "") or ""
     username = getattr(chat, "username", "") or ""
@@ -94,52 +92,78 @@ def get_chat_label(chat) -> str:
     return ", ".join(parts)
 
 
-# ==================== 数据库（随机视频）====================
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ==================== 数据库（PostgreSQL）====================
+def get_pg():
+    """获取数据库连接，断线自动重连"""
+    global _pg_conn
+    if _pg_conn is None or _pg_conn.closed:
+        if not DATABASE_URL:
+            return None
+        try:
+            _pg_conn = psycopg2.connect(DATABASE_URL)
+            _pg_conn.autocommit = True
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ 数据库连接失败: {e}")
+            return None
+    return _pg_conn
 
 
 def init_db():
-    with get_db() as conn:
-        conn.execute("""
+    if not DATABASE_URL:
+        print("⚠️  DATABASE_URL 未设置，视频收录功能不可用")
+        return
+
+    conn = get_pg()
+    if conn is None:
+        return
+
+    with conn.cursor() as cur:
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                message_id BIGINT NOT NULL,
                 chat_id TEXT NOT NULL,
                 file_id TEXT,
                 file_unique_id TEXT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, message_id)
             )
         """)
-        conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_video_unique
-            ON videos(chat_id, message_id)
-        """)
+    print("✅ PostgreSQL 数据库就绪")
 
 
 def add_video(message_id: int, chat_id: str, file_id: str, file_unique_id: str):
-    with get_db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO videos (message_id, chat_id, file_id, file_unique_id) "
-            "VALUES (?, ?, ?, ?)",
+    conn = get_pg()
+    if conn is None:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO videos (message_id, chat_id, file_id, file_unique_id) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (chat_id, message_id) DO NOTHING",
             (message_id, chat_id, file_id, file_unique_id),
         )
 
 
 def get_random_video() -> dict | None:
-    with get_db() as conn:
-        row = conn.execute(
+    conn = get_pg()
+    if conn is None:
+        return None
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
             "SELECT message_id, chat_id FROM videos ORDER BY RANDOM() LIMIT 1"
-        ).fetchone()
+        )
+        row = cur.fetchone()
     return dict(row) if row else None
 
 
 def get_video_count() -> int:
-    with get_db() as conn:
-        row = conn.execute("SELECT COUNT(*) as cnt FROM videos").fetchone()
-    return row["cnt"] if row else 0
+    conn = get_pg()
+    if conn is None:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM videos")
+        row = cur.fetchone()
+    return row[0] if row else 0
 
 
 # ==================== 命令处理器 ====================
@@ -176,12 +200,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== 核心：消息处理（群聊 + 频道）====================
 async def on_source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    统一处理群聊消息和频道消息：
-      1. 自动发现未知群聊/频道，打印 ID 到日志
-      2. 检查关键词 → 转发给目标机器人
-    """
-    # 频道消息在 channel_post 字段，群聊消息在 message 字段
     msg = update.channel_post or update.message
     if msg is None:
         return
@@ -189,25 +207,26 @@ async def on_source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = msg.chat
     chat_id = chat.id
 
-    # ---------- 自动发现未知来源 ----------
-    source_list = SOURCE_CHANNELS  # may be empty list
+    # ---------- 自动发现未知群聊 ----------
+    source_list = SOURCE_CHANNELS
     is_source = any(is_chat_match(chat, ch) for ch in source_list)
 
     if not is_source and chat_id not in _discovered_chats:
         _discovered_chats.add(chat_id)
         chat_type = chat.type or "?"
         label = get_chat_label(chat)
+        is_group = chat_type in ("group", "supergroup")
         print("=" * 50)
-        print(f"[🔍 发现新{ '群聊' if chat_type in ('group','supergroup') else '频道' }]")
+        print(f"[🔍 发现新{'群聊' if is_group else '频道'}]")
         print(f"    ID: {chat_id}")
         print(f"    类型: {chat_type}")
         print(f"    名称: {label}")
-        print(f"    把上面这个 ID 加到 Zeabur 环境变量 SOURCE_CHANNELS 即可开始监听")
+        print(f"    把上面这个 ID 加到 Zeabur 环境变量 SOURCE_CHANNELS 即可")
         print("=" * 50)
 
     # ---------- 关键词转发 ----------
     if not SOURCE_CHANNELS or not KEYWORDS or not TARGET_BOT or not DEST_CHANNEL:
-        return  # 配置不完整，只做发现不转发
+        return
 
     if not is_source:
         return
@@ -216,7 +235,6 @@ async def on_source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not any_keyword_match(text):
         return
 
-    # 命中！转发给目标机器人
     matched = [kw for kw in KEYWORDS if kw.lower() in text.lower()]
     try:
         await context.bot.forward_message(
@@ -232,9 +250,8 @@ async def on_source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[{datetime.now()}] ❌ 转发至 {TARGET_BOT} 失败: {e}")
 
 
-# ==================== 目标机器人回复 → 转发到你的频道 ====================
+# ==================== 目标机器人回复 → 转发 ====================
 async def on_target_bot_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """目标机器人回复 → 转发到目标频道"""
     msg = update.message
     if msg is None:
         return
@@ -254,7 +271,7 @@ async def on_target_bot_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
         print(f"[{datetime.now()}] ❌ 转发至 {DEST_CHANNEL} 失败: {e}")
 
 
-# ==================== 视频收录（/random 用）====================
+# ==================== 视频收录 ====================
 async def on_channel_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
     if msg is None or msg.video is None:
@@ -277,13 +294,12 @@ async def on_channel_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== 错误处理 ====================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """PTB 运行时错误回调，防止单个错误导致整个机器人崩溃"""
     err = context.error
     print(f"[{datetime.now()}] ⚠️ 运行时错误: {err}")
 
 
+# ==================== 构建 Application ====================
 def build_app() -> Application:
-    """构建 Application（每次重试时重新创建，避免状态残留）"""
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -293,22 +309,16 @@ def build_app() -> Application:
         .build()
     )
 
-    # 错误处理器
     app.add_error_handler(error_handler)
 
-    # 命令
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("random", random_video))
     app.add_handler(CommandHandler("stats", stats))
 
-    # 群聊 + 频道消息
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_source_message))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_source_message))
-
-    # 目标机器人回复
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, on_target_bot_reply))
 
-    # 视频收录
     if CHANNEL_ID:
         app.add_handler(MessageHandler(
             filters.ChatType.CHANNEL & filters.VIDEO, on_channel_video,
@@ -320,11 +330,16 @@ def build_app() -> Application:
 # ==================== 主程序 ====================
 def main():
     init_db()
-    print(f"📦 数据库就绪，当前收录 {get_video_count()} 条视频")
+
+    count = get_video_count()
+    if DATABASE_URL:
+        print(f"📦 数据库就绪，当前收录 {count} 条视频")
 
     print("=" * 50)
     print("当前配置：")
     print(f"  BOT_TOKEN:     {BOT_TOKEN[:8]}...（已隐藏）")
+    db_info = "已配置" if DATABASE_URL else "未配置（视频功能不可用）"
+    print(f"  数据库:        {db_info}")
     print(f"  源频道/群聊:   {SOURCE_CHANNELS or '(未配置，仅自动发现)'}")
     print(f"  关键词:        {KEYWORDS or '(未配置)'}")
     print(f"  目标机器人:    {TARGET_BOT or '(未配置)'}")
@@ -353,7 +368,6 @@ def main():
             sys.exit(0)
         except Exception as e:
             err_str = str(e)
-            # Conflict 意味着旧实例还未完全退出，延长等待
             if "Conflict" in err_str:
                 wait = 15
                 print(f"⏳ 检测到旧实例未退出，等待 {wait} 秒...")
